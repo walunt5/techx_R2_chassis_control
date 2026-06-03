@@ -1,0 +1,15 @@
+string cmd_type
+string from_block
+string target_block
+int32 current_h
+int32 target_h
+string edge_id
+float32 timeout_sec
+---
+bool success
+uint8 final_state
+uint16 error_code
+string message
+---
+uint8 state
+string message

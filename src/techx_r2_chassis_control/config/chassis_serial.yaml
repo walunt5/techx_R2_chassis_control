@@ -1,0 +1,14 @@
+chassis_serial_node:
+  ros__parameters:
+    port: /dev/ttyUSB0
+    baudrate: 115200
+    serial_timeout_sec: 0.02
+    velocity_rate_hz: 30.0
+    cmd_vel_timeout_sec: 0.2
+    task_ack_timeout_sec: 0.1
+    task_max_retries: 3
+    task_default_timeout_sec: 10.0
+    send_zero_in_task_mode: true
+    log_velocity_frames: false
+    log_rx_frames: false
+    estop_repeat_count: 3

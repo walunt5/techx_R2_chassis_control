@@ -1,0 +1,27 @@
+chassis_serial_node:
+  ros__parameters:
+    port: /tmp/r2_chassis_host
+    baudrate: 115200
+    serial_timeout_sec: 0.02
+    velocity_rate_hz: 30.0
+    cmd_vel_timeout_sec: 0.2
+    task_ack_timeout_sec: 0.1
+    task_max_retries: 3
+    task_default_timeout_sec: 10.0
+    send_zero_in_task_mode: true
+    log_velocity_frames: false
+    log_rx_frames: true
+    estop_repeat_count: 3
+
+mock_chassis_stm32:
+  ros__parameters:
+    port: /tmp/r2_chassis_stm32
+    baudrate: 115200
+    serial_timeout_sec: 0.02
+    simulate_error: false
+    drop_first_ack: false
+    running_delay_sec: 0.3
+    done_delay_sec: 1.0
+    log_velocity: true
+    log_rx_frames: false
+    log_tx_frames: false
