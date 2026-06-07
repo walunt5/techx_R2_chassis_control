@@ -8,7 +8,7 @@ chassis_serial_node:
     task_ack_timeout_sec: 0.1
     task_max_retries: 3
     task_default_timeout_sec: 10.0
-    send_zero_in_task_mode: true
+    send_zero_in_task_mode: false
     log_velocity_frames: false
     log_rx_frames: true
     estop_repeat_count: 3
