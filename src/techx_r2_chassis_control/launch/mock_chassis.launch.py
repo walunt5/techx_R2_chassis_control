@@ -32,8 +32,8 @@ def generate_launch_description():
             'baudrate': baudrate,
             'velocity_rate_hz': 30.0,
             'cmd_vel_timeout_sec': 0.2,
-            'ack_timeout_sec': 0.1,
-            'max_retries': 3,
+            'task_ack_timeout_sec': 0.1,
+            'task_max_retries': 3,
             'send_zero_in_task_mode': True,
             'estop_repeat_count': 3,
         }]
