@@ -26,6 +26,18 @@ LIFT_CONTROL:
     不包含 STOP / UP / DOWN / SUPPORT_DOWN / RETRACT_UP
 ```
 
+第一版台阶协议也采用最小设计：
+
+```text
+STEP_COMMAND:
+    只使用 step_cmd
+    delta_h_mm / edge_id / flags 统一填 0，STM32 暂时忽略
+
+STEP_STATUS:
+    只使用 state / error_code 判断任务状态
+    progress 统一填 0，上位机暂时不使用
+```
+
 ## Packages
 
 本工程包含两个 ROS 2 package：
@@ -470,12 +482,14 @@ cmd_type = 0x32
 data 区：
 
 ```text
-data0: step_cmd
-data1~2: delta_h_mm，int16，小端
-data3: edge_id
-data4: flags
+data0: step_cmd，第一版实际使用
+data1~2: delta_h_mm，第一版统一填 0，STM32 暂时忽略
+data3: edge_id，第一版统一填 0，STM32 暂时忽略
+data4: flags，第一版统一填 0，STM32 暂时忽略
 data5~7: reserved，填 0
 ```
+
+第一版 `STEP_COMMAND` 的实际控制只依赖 `step_cmd`。`delta_h_mm / edge_id / flags` 都作为预留字段保留，但当前版本不参与 STM32 控制。
 
 第一版 step_cmd：
 
@@ -501,12 +515,14 @@ cmd_type = 0x42
 data 区：
 
 ```text
-data0: step_cmd
-data1: state
-data2: error_code
-data3: progress
+data0: step_cmd，回原始 step_cmd
+data1: state，第一版实际使用
+data2: error_code，第一版实际使用
+data3: progress，第一版统一填 0，上位机暂时不使用
 data4~7: reserved，填 0
 ```
+
+第一版 `STEP_STATUS` 的成功/失败判断只依赖 `state` 和 `error_code`。`progress` 字段保留为预留显示字段，当前版本统一填 0。
 
 第一版 state：
 
@@ -813,12 +829,14 @@ Action goal 发送
 chassis_serial_node 进入 TaskMode
 发送 0 速度
 发送 STEP_COMMAND
-mock 返回 STEP_STATUS ACK
-mock 返回 STEP_STATUS RUNNING
-mock 返回 STEP_STATUS DONE
+mock 返回 STEP_STATUS ACK，progress=0
+mock 返回 STEP_STATUS RUNNING，progress=0
+mock 返回 STEP_STATUS DONE，progress=0
 Action 返回 success=true
 chassis_serial_node 回到 NormalVelocity
 ```
+
+当前第一版虽然 `StepCommand.action` 里仍然保留 `current_h / target_h / edge_id`，但串口 `STEP_COMMAND` 实际只使用 `step_cmd`，其余字段统一填 0。
 
 ---
 
@@ -1076,6 +1094,34 @@ seq = 原命令 seq 表示任务反馈
 ```text
 收到后回 STEP_STATUS ACK / RUNNING / DONE / ERROR。
 爬阶内部动作由 STM32 自己控制。
+第一版只使用 data0 的 step_cmd。
+data1~2 delta_h_mm、data3 edge_id、data4 flags 暂时忽略。
+STEP_STATUS 的 progress 统一填 0。
+```
+
+第一版 STM32 处理建议：
+
+```c
+uint8_t step_cmd = data[0];
+int16_t delta_h_mm = read_i16_le(&data[1]);
+uint8_t edge_id = data[3];
+uint8_t flags = data[4];
+
+(void)delta_h_mm;
+(void)edge_id;
+(void)flags;
+
+send_step_status(seq, step_cmd, STATE_ACK, ERROR_OK, 0);
+
+// 执行对应写死动作：MOVE_FLAT / CLIMB_200 / CLIMB_400 / DESCEND_200 / DESCEND_400
+
+send_step_status(seq, step_cmd, STATE_RUNNING, ERROR_OK, 0);
+
+// 动作完成
+send_step_status(seq, step_cmd, STATE_DONE, ERROR_OK, 0);
+
+// 动作失败
+send_step_status(seq, step_cmd, STATE_ERROR, ERROR_MOTOR_ERROR, 0);
 ```
 
 ### `ESTOP`

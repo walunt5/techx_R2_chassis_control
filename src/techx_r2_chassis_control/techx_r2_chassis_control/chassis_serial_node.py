@@ -242,7 +242,6 @@ class ChassisSerialNode(Node):
 
         try:
             step_cmd = step_cmd_from_string(goal.cmd_type)
-            edge_id = parse_edge_id(goal.edge_id)
         except ValueError as exc:
             goal_handle.abort()
             result.success = False
@@ -254,9 +253,15 @@ class ChassisSerialNode(Node):
         timeout_sec = float(goal.timeout_sec) if goal.timeout_sec and goal.timeout_sec > 0 else float(
             self.get_parameter("task_default_timeout_sec").value
         )
-        delta_h_mm = int(goal.target_h - goal.current_h)
+
+        # 第一版 STEP_COMMAND 只使用 step_cmd。
+        # delta_h_mm / edge_id / flags 暂时不参与 STM32 控制，统一填 0。
+        delta_h_mm = 0
+        edge_id = 0
+        flags = 0
+
         seq = self._next_task_seq()
-        frame = build_step_command(seq, step_cmd, delta_h_mm, edge_id=edge_id, flags=0)
+        frame = build_step_command(seq, step_cmd, delta_h_mm, edge_id=edge_id, flags=flags)
 
         pending = PendingTask(
             kind=TASK_KIND_STEP,
@@ -280,8 +285,8 @@ class ChassisSerialNode(Node):
             self._pending_task = pending
 
         self.get_logger().info(
-            f"Start STEP_COMMAND seq={seq} cmd={goal.cmd_type} from={goal.from_block} "
-            f"to={goal.target_block} delta_h={delta_h_mm} edge_id={edge_id} timeout={timeout_sec:.2f}s"
+            f"Start STEP_COMMAND seq={seq} cmd={goal.cmd_type} "
+            f"delta_h=0 edge_id=0 flags=0 timeout={timeout_sec:.2f}s"
         )
         self._send_zero_velocity()
         pending.last_send_time = self._now_monotonic()

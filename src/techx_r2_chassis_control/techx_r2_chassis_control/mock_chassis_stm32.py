@@ -283,8 +283,8 @@ class MockChassisSTM32(Node):
             if self._current_seq != seq:
                 return
             self._current_state = STATE_RUNNING
-            self._current_progress = 50
-        self._send_step_status(seq, step_cmd, STATE_RUNNING, ERROR_OK, 50)
+            self._current_progress = 0
+        self._send_step_status(seq, step_cmd, STATE_RUNNING, ERROR_OK, 0)
 
         time.sleep(max(0.0, done_delay))
         with self._state_lock:
@@ -293,17 +293,17 @@ class MockChassisSTM32(Node):
             if simulate_error:
                 self._current_state = STATE_ERROR
                 self._current_error = ERROR_MOTOR_ERROR
-                self._current_progress = 50
+                self._current_progress = 0
                 state = STATE_ERROR
                 error = ERROR_MOTOR_ERROR
-                progress = 50
+                progress = 0
             else:
                 self._current_state = STATE_DONE
                 self._current_error = ERROR_OK
-                self._current_progress = 100
+                self._current_progress = 0
                 state = STATE_DONE
                 error = ERROR_OK
-                progress = 100
+                progress = 0
         self._send_step_status(seq, step_cmd, state, error, progress)
 
     def _handle_lift_control(self, seq: int, data: bytes) -> None:
