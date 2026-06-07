@@ -16,10 +16,12 @@ try:
 except ImportError as exc:  # pragma: no cover - runtime dependency on robot
     serial = None
 
-from techx_r2_chassis_interfaces.action import StepCommand
+from techx_r2_chassis_interfaces.action import LiftControl, StepCommand
+from techx_r2_chassis_interfaces.msg import LiftStatus as LiftStatusMsg
 from techx_r2_chassis_interfaces.srv import EStop
 
 from .protocol import (
+    CMD_LIFT_STATUS,
     CMD_STEP_STATUS,
     ERROR_MOTOR_ERROR,
     ERROR_OK,
@@ -31,16 +33,21 @@ from .protocol import (
     STATE_RUNNING,
     build_chassis_vel_cmd,
     build_estop,
+    build_lift_control,
     build_step_command,
     extract_frames,
     frame_to_hex,
     parse_edge_id,
+    parse_lift_status,
     parse_step_status,
     step_cmd_from_string,
 )
 
 MODE_NORMAL_VELOCITY = "NormalVelocity"
 MODE_TASK = "TaskMode"
+
+TASK_KIND_STEP = "step"
+TASK_KIND_LIFT = "lift"
 
 
 @dataclass
@@ -53,10 +60,18 @@ class LatestVelocity:
 
 @dataclass
 class PendingTask:
+    """A generic reliable task.
+
+    First version keeps only one reliable task at a time.  The task can be a
+    STEP_COMMAND or a LIFT_CONTROL command.  ACK timeout / resend / final result
+    handling is shared by both task kinds.
+    """
+
+    kind: str
     seq: int
     frame: bytes
-    step_cmd: int
-    cmd_type_text: str
+    task_id: int
+    cmd_text: str
     timeout_sec: float
     goal_handle: object
     created_time: float = field(default_factory=time.monotonic)
@@ -108,12 +123,29 @@ class ChassisSerialNode(Node):
         self._pending_task: Optional[PendingTask] = None
 
         self._cmd_vel_sub = self.create_subscription(Twist, "/cmd_vel", self._on_cmd_vel, 10)
+
         self._estop_srv = self.create_service(EStop, "/r2_chassis/estop", self._on_estop)
-        self._action_server = ActionServer(
+
+        self._step_action_server = ActionServer(
             self,
             StepCommand,
             "/r2_chassis/step_command",
             execute_callback=self._execute_step_command,
+            goal_callback=self._goal_callback,
+            cancel_callback=self._cancel_callback,
+        )
+
+        self._lift_status_pub = self.create_publisher(
+            LiftStatusMsg,
+            "/r2_chassis/lift_status",
+            10,
+        )
+
+        self._lift_action_server = ActionServer(
+            self,
+            LiftControl,
+            "/r2_chassis/lift_control",
+            execute_callback=self._execute_lift_control,
             goal_callback=self._goal_callback,
             cancel_callback=self._cancel_callback,
         )
@@ -191,11 +223,11 @@ class ChassisSerialNode(Node):
             frame = build_chassis_vel_cmd(seq, latest.vx_mm_s, latest.vy_mm_s, latest.omega_mrad_s)
         self._write_frame(frame, "vel" if log_velocity_frames else "")
 
-    def _goal_callback(self, goal_request: StepCommand.Goal) -> GoalResponse:
+    def _goal_callback(self, goal_request) -> GoalResponse:
         del goal_request
         with self._state_lock:
             if self._pending_task is not None:
-                self.get_logger().warn("Reject step_command goal: another reliable task is running")
+                self.get_logger().warn("Reject reliable task goal: another reliable task is running")
                 return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
@@ -227,10 +259,11 @@ class ChassisSerialNode(Node):
         frame = build_step_command(seq, step_cmd, delta_h_mm, edge_id=edge_id, flags=0)
 
         pending = PendingTask(
+            kind=TASK_KIND_STEP,
             seq=seq,
             frame=frame,
-            step_cmd=step_cmd,
-            cmd_type_text=goal.cmd_type,
+            task_id=step_cmd,
+            cmd_text=goal.cmd_type,
             timeout_sec=timeout_sec,
             goal_handle=goal_handle,
         )
@@ -254,7 +287,6 @@ class ChassisSerialNode(Node):
         pending.last_send_time = self._now_monotonic()
         self._write_frame(frame, "step_command")
 
-        # Wait until serial feedback or reliable timer marks the task as done.
         pending.done_event.wait(timeout=timeout_sec + 1.0)
 
         with self._state_lock:
@@ -277,14 +309,115 @@ class ChassisSerialNode(Node):
         result.message = message
         return result
 
-    def _publish_task_feedback(self, pending: PendingTask, state: int, message: str) -> None:
+    def _execute_lift_control(self, goal_handle) -> LiftControl.Result:
+        goal = goal_handle.request
+        result = LiftControl.Result()
+
+        target_h_mm = int(goal.target_h_mm)
+        mask = int(goal.mask)
+
+        # 第一版只允许 bit0/bit1/bit2，且至少选择一个升降机构。
+        if mask == 0 or (mask & ~0x07):
+            goal_handle.abort()
+            result.success = False
+            result.final_state = STATE_ERROR
+            result.error_code = ERROR_MOTOR_ERROR
+            result.message = f"invalid lift mask=0x{mask:02X}, valid: 0x01/0x02/0x04/0x07"
+            return result
+
+        timeout_sec = float(goal.timeout_sec) if goal.timeout_sec and goal.timeout_sec > 0 else float(
+            self.get_parameter("task_default_timeout_sec").value
+        )
+
+        seq = self._next_task_seq()
+        frame = build_lift_control(seq=seq, target_h_mm=target_h_mm, mask=mask)
+
+        pending = PendingTask(
+            kind=TASK_KIND_LIFT,
+            seq=seq,
+            frame=frame,
+            task_id=mask,
+            cmd_text=f"LIFT target_h={target_h_mm} mask=0x{mask:02X}",
+            timeout_sec=timeout_sec,
+            goal_handle=goal_handle,
+        )
+
+        with self._state_lock:
+            if self._pending_task is not None:
+                goal_handle.abort()
+                result.success = False
+                result.final_state = STATE_ERROR
+                result.error_code = ERROR_MOTOR_ERROR
+                result.message = "another reliable task is running"
+                return result
+            self._mode = MODE_TASK
+            self._pending_task = pending
+
+        self.get_logger().info(
+            f"Start LIFT_CONTROL seq={seq} target_h={target_h_mm} "
+            f"mask=0x{mask:02X} timeout={timeout_sec:.2f}s"
+        )
+        self._send_zero_velocity()
+        pending.last_send_time = self._now_monotonic()
+        self._write_frame(frame, "lift_control")
+
+        pending.done_event.wait(timeout=timeout_sec + 1.0)
+
+        with self._state_lock:
+            final_state = pending.final_state
+            error_code = pending.error_code
+            message = pending.message or "lift_control ended without final message"
+            success = final_state == STATE_DONE and error_code == ERROR_OK
+            if self._pending_task is pending:
+                self._pending_task = None
+            self._mode = MODE_NORMAL_VELOCITY
+
+        if success:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+
+        result.success = success
+        result.final_state = final_state
+        result.error_code = error_code
+        result.message = message
+        return result
+
+    def _publish_step_feedback(self, pending: PendingTask, state: int, message: str) -> None:
         feedback = StepCommand.Feedback()
         feedback.state = state
         feedback.message = message
         try:
             pending.goal_handle.publish_feedback(feedback)
         except Exception as exc:
-            self.get_logger().warn(f"Failed to publish action feedback: {exc}")
+            self.get_logger().warn(f"Failed to publish step action feedback: {exc}")
+
+    def _publish_lift_feedback(self, pending: PendingTask, status, message: str) -> None:
+        feedback = LiftControl.Feedback()
+        feedback.state = int(status.state)
+        feedback.lift1_mm = int(status.lift1_mm)
+        feedback.lift2_mm = int(status.lift2_mm)
+        feedback.lift3_mm = int(status.lift3_mm)
+        feedback.message = message
+        try:
+            pending.goal_handle.publish_feedback(feedback)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to publish lift action feedback: {exc}")
+
+    def _publish_lift_status_msg(self, status, is_task_feedback: bool, message: str) -> None:
+        msg = LiftStatusMsg()
+        msg.stamp = self.get_clock().now().to_msg()
+        msg.lift1_mm = int(status.lift1_mm)
+        msg.lift2_mm = int(status.lift2_mm)
+        msg.lift3_mm = int(status.lift3_mm)
+        msg.avg_height_mm = int(status.avg_height_mm)
+        msg.max_diff_mm = int(status.max_diff_mm)
+        msg.state = int(status.state)
+        msg.error_code = int(status.error_code)
+        msg.is_task_feedback = bool(is_task_feedback)
+        msg.seq = int(status.seq)
+        msg.message = message
+        self._lift_status_pub.publish(msg)
 
     def _reliable_timer_cb(self) -> None:
         with self._state_lock:
@@ -298,7 +431,7 @@ class ChassisSerialNode(Node):
             if now - pending.created_time > pending.timeout_sec:
                 pending.final_state = STATE_ERROR
                 pending.error_code = ERROR_MOTOR_ERROR
-                pending.message = f"STEP_COMMAND timeout after {pending.timeout_sec:.2f}s"
+                pending.message = f"{pending.kind} task timeout after {pending.timeout_sec:.2f}s"
                 pending.done_event.set()
                 self.get_logger().error(pending.message)
                 return
@@ -309,6 +442,7 @@ class ChassisSerialNode(Node):
                     pending.last_send_time = now
                     frame = pending.frame
                     seq = pending.seq
+                    kind = pending.kind
                 else:
                     pending.final_state = STATE_ERROR
                     pending.error_code = ERROR_MOTOR_ERROR
@@ -319,8 +453,8 @@ class ChassisSerialNode(Node):
             else:
                 return
 
-        self.get_logger().warn(f"ACK timeout, resend STEP_COMMAND seq={seq}, retry={pending.retry_count}")
-        self._write_frame(frame, "step_command_resend")
+        self.get_logger().warn(f"ACK timeout, resend {kind} task seq={seq}, retry={pending.retry_count}")
+        self._write_frame(frame, f"{kind}_resend")
 
     def _serial_read_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -341,10 +475,17 @@ class ChassisSerialNode(Node):
         if bool(self.get_parameter("log_rx_frames").value):
             self.get_logger().info(f"RX: {frame_to_hex(frame.raw)}")
 
-        if frame.cmd_type != CMD_STEP_STATUS:
-            self.get_logger().debug(f"Ignore RX cmd_type=0x{frame.cmd_type:02X}")
+        if frame.cmd_type == CMD_STEP_STATUS:
+            self._handle_step_status(frame)
             return
 
+        if frame.cmd_type == CMD_LIFT_STATUS:
+            self._handle_lift_status(frame)
+            return
+
+        self.get_logger().debug(f"Ignore RX cmd_type=0x{frame.cmd_type:02X}")
+
+    def _handle_step_status(self, frame) -> None:
         try:
             status = parse_step_status(frame)
         except Exception as exc:
@@ -356,6 +497,11 @@ class ChassisSerialNode(Node):
             if pending is None:
                 self.get_logger().warn(f"STEP_STATUS seq={status.seq} but no pending task")
                 return
+            if pending.kind != TASK_KIND_STEP:
+                self.get_logger().warn(
+                    f"Ignore STEP_STATUS seq={status.seq}; pending task kind={pending.kind}"
+                )
+                return
             if status.seq != pending.seq:
                 self.get_logger().warn(f"Ignore STEP_STATUS seq={status.seq}, pending seq={pending.seq}")
                 return
@@ -366,7 +512,7 @@ class ChassisSerialNode(Node):
 
             if status.state in (STATE_ACK, STATE_RUNNING):
                 pending.ack_received = True
-                self._publish_task_feedback(pending, status.state, message)
+                self._publish_step_feedback(pending, status.state, message)
                 self.get_logger().info(message)
                 return
 
@@ -376,7 +522,7 @@ class ChassisSerialNode(Node):
                 pending.error_code = status.error_code
                 pending.message = message
                 pending.done_event.set()
-                self._publish_task_feedback(pending, status.state, message)
+                self._publish_step_feedback(pending, status.state, message)
                 self.get_logger().info(message)
                 return
 
@@ -386,11 +532,76 @@ class ChassisSerialNode(Node):
                 pending.error_code = status.error_code or ERROR_MOTOR_ERROR
                 pending.message = message
                 pending.done_event.set()
-                self._publish_task_feedback(pending, status.state, message)
+                self._publish_step_feedback(pending, status.state, message)
                 self.get_logger().error(message)
                 return
 
             self.get_logger().warn(f"Unknown step state: {message}")
+
+    def _handle_lift_status(self, frame) -> None:
+        try:
+            status = parse_lift_status(frame)
+        except Exception as exc:
+            self.get_logger().warn(f"Invalid LIFT_STATUS frame: {exc}")
+            return
+
+        message = (
+            f"LIFT_STATUS seq={status.seq} "
+            f"lift=({status.lift1_mm},{status.lift2_mm},{status.lift3_mm}) "
+            f"avg={status.avg_height_mm} diff={status.max_diff_mm} "
+            f"state={status.state_name} error=0x{status.error_code:02X}"
+        )
+
+        # 所有 LIFT_STATUS 都发布到 topic：
+        #   seq=0    : STM32 主动周期状态上报
+        #   seq!=0   : LIFT_CONTROL 任务反馈
+        is_task_feedback = status.seq != 0
+        self._publish_lift_status_msg(status, is_task_feedback, message)
+
+        with self._state_lock:
+            pending = self._pending_task
+            if pending is None:
+                if status.seq != 0:
+                    self.get_logger().warn(f"LIFT_STATUS seq={status.seq} but no pending task")
+                return
+
+            if pending.kind != TASK_KIND_LIFT:
+                # 正在执行 STEP_COMMAND 时，LIFT_STATUS 仍然会发布成 topic，
+                # 但不参与当前 step action 的状态机。
+                return
+
+            if status.seq != pending.seq:
+                if status.seq != 0:
+                    self.get_logger().warn(f"Ignore LIFT_STATUS seq={status.seq}, pending seq={pending.seq}")
+                return
+
+            if status.state in (STATE_ACK, STATE_RUNNING):
+                pending.ack_received = True
+                self._publish_lift_feedback(pending, status, message)
+                self.get_logger().info(message)
+                return
+
+            if status.state == STATE_DONE:
+                pending.ack_received = True
+                pending.final_state = STATE_DONE
+                pending.error_code = status.error_code
+                pending.message = message
+                pending.done_event.set()
+                self._publish_lift_feedback(pending, status, message)
+                self.get_logger().info(message)
+                return
+
+            if status.state == STATE_ERROR:
+                pending.ack_received = True
+                pending.final_state = STATE_ERROR
+                pending.error_code = status.error_code or ERROR_MOTOR_ERROR
+                pending.message = message
+                pending.done_event.set()
+                self._publish_lift_feedback(pending, status, message)
+                self.get_logger().error(message)
+                return
+
+            self.get_logger().warn(f"Unknown lift state: {message}")
 
     def _on_estop(self, request: EStop.Request, response: EStop.Response) -> EStop.Response:
         if not request.trigger:

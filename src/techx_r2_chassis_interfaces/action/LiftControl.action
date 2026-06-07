@@ -1,0 +1,14 @@
+int32 target_h_mm
+uint8 mask
+float32 timeout_sec
+---
+bool success
+uint8 final_state
+uint16 error_code
+string message
+---
+uint8 state
+int32 lift1_mm
+int32 lift2_mm
+int32 lift3_mm
+string message

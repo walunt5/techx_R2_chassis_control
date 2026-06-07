@@ -9,12 +9,36 @@ Frame layout, fixed 18 bytes:
   Byte5-12   data[8]
   Byte13-15  reserved[3]
   Byte16-17  CRC16_MODBUS little endian
+
+First-version command set:
+  0x30 = CHASSIS_VEL_CMD
+  0x31 = LIFT_CONTROL
+  0x32 = STEP_COMMAND
+  0x41 = LIFT_STATUS
+  0x42 = STEP_STATUS
+  0xE0 = ESTOP
+
+LIFT_CONTROL v1, Host -> STM32:
+  data0~1: target_h_mm, int16 little endian
+  data2:   mask, bit0=lift1, bit1=lift2, bit2=lift3
+  data3~7: reserved, zero
+
+LIFT_STATUS v1, STM32 -> Host:
+  data0~1: lift1_mm, int16 little endian
+  data2~3: lift2_mm, int16 little endian
+  data4~5: lift3_mm, int16 little endian
+  data6:   state
+  data7:   error_code
+
+LIFT_STATUS seq rule:
+  seq = original LIFT_CONTROL seq: reliable task feedback.
+  seq = 0: STM32 periodic status report.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Tuple
 import struct
 
 FRAME_LEN = 18
@@ -24,8 +48,12 @@ FRAME_TYPE_HOST_TO_STM32 = 0x01
 FRAME_TYPE_STM32_TO_HOST = 0x02
 
 CMD_CHASSIS_VEL = 0x30
+CMD_LIFT_CONTROL = 0x31
 CMD_STEP_COMMAND = 0x32
+
+CMD_LIFT_STATUS = 0x41
 CMD_STEP_STATUS = 0x42
+
 CMD_ESTOP = 0xE0
 
 STEP_MOVE_FLAT = 0
@@ -88,6 +116,35 @@ class StepStatus:
     @property
     def step_cmd_name(self) -> str:
         return STEP_CMD_ID_TO_NAME.get(self.step_cmd, f"UNKNOWN({self.step_cmd})")
+
+
+@dataclass(frozen=True)
+class LiftStatus:
+    """Parsed LIFT_STATUS frame.
+
+    seq == 0 means STM32 periodic status report.
+    seq != 0 usually means feedback for a LIFT_CONTROL reliable task.
+    """
+
+    seq: int
+    lift1_mm: int
+    lift2_mm: int
+    lift3_mm: int
+    state: int
+    error_code: int
+
+    @property
+    def state_name(self) -> str:
+        return STATE_NAME.get(self.state, f"UNKNOWN({self.state})")
+
+    @property
+    def avg_height_mm(self) -> int:
+        return int(round((self.lift1_mm + self.lift2_mm + self.lift3_mm) / 3.0))
+
+    @property
+    def max_diff_mm(self) -> int:
+        values = [self.lift1_mm, self.lift2_mm, self.lift3_mm]
+        return max(values) - min(values)
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -201,6 +258,83 @@ def decode_chassis_vel_data(data: bytes) -> Tuple[int, int, int, int]:
     if len(data) != 8:
         raise ValueError("velocity data must be 8 bytes")
     return le_to_i16(data, 0), le_to_i16(data, 2), le_to_i16(data, 4), data[6]
+
+
+def build_lift_control(seq: int, target_h_mm: int, mask: int = 0x07) -> bytes:
+    """Build first-version LIFT_CONTROL frame.
+
+    This command means: move the lifts selected by mask to target_h_mm.
+
+    Args:
+        seq: reliable-task sequence id. Host should use non-zero seq.
+        target_h_mm: target lift height in millimeters.
+        mask: bit0=lift1, bit1=lift2, bit2=lift3.
+              0x07 means all three lifts, i.e. whole chassis height.
+    """
+    data = bytearray(8)
+    data[0:2] = i16_to_le(clamp_i16(target_h_mm))
+    data[2] = mask & 0x07
+    data[3:8] = b"\x00\x00\x00\x00\x00"
+    return pack_frame(FRAME_TYPE_HOST_TO_STM32, seq, CMD_LIFT_CONTROL, data)
+
+
+def decode_lift_control_data(data: bytes) -> Tuple[int, int]:
+    """Decode first-version LIFT_CONTROL data area.
+
+    Returns:
+        (target_h_mm, mask)
+    """
+    if len(data) != 8:
+        raise ValueError("lift control data must be 8 bytes")
+    target_h_mm = le_to_i16(data, 0)
+    mask = data[2]
+    return target_h_mm, mask
+
+
+def build_lift_status(
+    seq: int,
+    lift1_mm: int,
+    lift2_mm: int,
+    lift3_mm: int,
+    state: int,
+    error_code: int = ERROR_OK,
+) -> bytes:
+    """Build first-version LIFT_STATUS frame.
+
+    Args:
+        seq: original LIFT_CONTROL seq for task feedback; 0 for periodic report.
+        lift1_mm: lift 1 measured height in millimeters.
+        lift2_mm: lift 2 measured height in millimeters.
+        lift3_mm: lift 3 measured height in millimeters.
+        state: STATE_ACK / STATE_RUNNING / STATE_DONE / STATE_ERROR.
+        error_code: protocol error code.
+    """
+    data = bytearray(8)
+    data[0:2] = i16_to_le(clamp_i16(lift1_mm))
+    data[2:4] = i16_to_le(clamp_i16(lift2_mm))
+    data[4:6] = i16_to_le(clamp_i16(lift3_mm))
+    data[6] = state & 0xFF
+    data[7] = error_code & 0xFF
+    return pack_frame(FRAME_TYPE_STM32_TO_HOST, seq, CMD_LIFT_STATUS, data)
+
+
+def parse_lift_status(frame: Frame | bytes | bytearray) -> LiftStatus:
+    if isinstance(frame, (bytes, bytearray)):
+        frame = parse_frame(frame)
+    if frame.frame_type != FRAME_TYPE_STM32_TO_HOST:
+        raise ProtocolError("LIFT_STATUS must be STM32->Host frame")
+    if frame.cmd_type != CMD_LIFT_STATUS:
+        raise ProtocolError(f"not LIFT_STATUS cmd_type=0x{frame.cmd_type:02X}")
+
+    data = frame.data
+    return LiftStatus(
+        seq=frame.seq,
+        lift1_mm=le_to_i16(data, 0),
+        lift2_mm=le_to_i16(data, 2),
+        lift3_mm=le_to_i16(data, 4),
+        state=data[6],
+        error_code=data[7],
+    )
 
 
 def build_step_command(seq: int, step_cmd: int, delta_h_mm: int, edge_id: int = 0, flags: int = 0) -> bytes:

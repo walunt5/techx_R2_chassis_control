@@ -29,6 +29,7 @@ setup(
             'test_cmd_vel_pub = techx_r2_chassis_control.test_cmd_vel_pub:main',
             'protocol_demo = techx_r2_chassis_control.protocol_demo:main',
             'test_estop_client = techx_r2_chassis_control.test_estop_client:main',
+            'test_lift_control_client = techx_r2_chassis_control.test_lift_control_client:main',
         ],
     },
 )
